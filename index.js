@@ -212,6 +212,19 @@ function transactional(query, done, work) {
       const res = work(tx)
       return Promise.resolve(res)
     })
+    // Close and wait until all in-flight queries are done
+    .then(
+      res => {
+        tx.close()
+        return tx.allQueries()
+          .then(() => Promise.resolve(res))
+      },
+      err => {
+        tx.close()
+        return tx.allQueries()
+          .then(() => Promise.reject(err))
+      }
+    )
     .then(
       res => {
         let p = Promise.resolve()
@@ -242,22 +255,70 @@ function Transaction(query) {
     return new Transaction(query)
   }
 
+  this._closed = false
   this._query = query
   this._committed = false
   this._rolledBack = false
+  this._queriesInFlight = 0
+  this._allQueriesPromise = null
+  this._allQueriesResolve = null
 }
 Transaction.prototype.query = function() {
+  if (this._closed) {
+    throw new Error("Failed to perform a query on a closed transaction")
+  }
   const args = slice.call(arguments)
-  return this._query.apply(null, args)
+  return this._performQuery.apply(this, args)
+}
+Transaction.prototype._performQuery = function() {
+  const args = slice.call(arguments)
+
+  const queryFinished = () => {
+    console.log(`Query finished. ${this._queriesInFlight} => ${this._queriesInFlight - 1}`)
+    this._queriesInFlight--
+    if (this._queriesInFlight === 0 && this._allQueriesResolve) {
+      console.log(`Resolving allQueries promise`)
+      this._allQueriesResolve()
+    }
+  }
+
+  console.log(`Query starting. ${this._queriesInFlight} => ${this._queriesInFlight + 1}`)
+  this._queriesInFlight++
+  let p = this._query.apply(null, args)
+  p.then(
+    queryFinished,
+    queryFinished
+  )
+  return p
+}
+Transaction.prototype.allQueries = function() {
+  if (this._allQueriesPromise) {
+    return this._allQueriesPromise
+  }
+
+  console.log(`Creating allQueries promise`)
+  this._allQueriesPromise = new Promise(resolve => {
+    this._allQueriesResolve = resolve
+    if (this._queriesInFlight === 0) {
+      resolve()
+    }
+  })
+
+  this._allQueriesPromise.then(() => console.log("allQueries promise resolved"))
+
+  return this._allQueriesPromise
+}
+Transaction.prototype.close = function() {
+  this._closed = true
 }
 Transaction.prototype.begin = function() {
-  return this.query('BEGIN')
+  return this._query('BEGIN')
 }
 Transaction.prototype.commit = function() {
   this._committed = true
-  return this.query('COMMIT')
+  return this._query('COMMIT')
 }
 Transaction.prototype.rollback = function() {
   this._rolledBack = true
-  return this.query('ROLLBACK')
+  return this._query('ROLLBACK')
 }

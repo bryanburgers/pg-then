@@ -237,4 +237,80 @@ describe('transactional', () => {
       })
     })
   })
+
+  describe('race conditions', () => {
+    function delay(timeout) {
+      return new Promise(resolve => {
+        setTimeout(() => {
+          resolve()
+        }, timeout)
+      })
+    }
+
+    it('a', () => {
+      const pool = pg.Pool(config)
+
+      // Test a query that gets started before and finishes after an error doesn't wreak havoc
+      return pool
+        .transactional(tx => {
+          const q1 = tx.query('SELECT pg_sleep(2); UPDATE account SET amount = 100000 WHERE id = 1')
+          const q2 = delay(1000).then(() => { throw new Error("ERROR") })
+          return Promise.all([q1])
+        })
+        .catch(() => delay(1200))
+        .then(() => {
+          return pool.query('SELECT id, amount FROM account ORDER BY id ASC')
+        })
+        .then((result) => {
+          // Make sure the accounts did not change
+          assert.equal(result.rowCount, 2)
+          assert.equal(result.rows[0].amount, 100)
+          assert.equal(result.rows[1].amount, 100)
+        })
+    })
+
+    it('b', () => {
+      const pool = pg.Pool(config)
+
+      // Test that trying to run a query AFTER another query has already rejected won't wreak havoc
+      return pool
+        .transactional(tx => {
+          const q1 = delay(1000).then(() => tx.query('UPDATE account SET amount = 100000 WHERE id = 1'))
+          const q2 = Promise.reject(new Error("ERROR"))
+          return Promise.all([q1, q2])
+        })
+        .catch(() => delay(1200))
+        .then(() => {
+          return pool.query('SELECT id, amount FROM account ORDER BY id ASC')
+        })
+        .then((result) => {
+          // Make sure the accounts did not change
+          assert.equal(result.rowCount, 2)
+          assert.equal(result.rows[0].amount, 100)
+          assert.equal(result.rows[1].amount, 100)
+        })
+    })
+
+    it('c', () => {
+      const pool = pg.Pool(config)
+
+      // Test that an error reported from the server on the connection doesn't sink us
+      return pool
+        .transactional(tx => {
+          const q1 = tx.query('SELECT pg_sleep(1); UPDATE account SET amount = 100000 WHERE id = 1')
+          const q2 = delay(1500).then(() => tx.query('SELECT * FROM nonexistanttable'))
+          return Promise.all([q1, q2])
+        })
+        .catch(() => delay(2200))
+        .then(() => {
+          return pool.query('SELECT id, amount FROM account ORDER BY id ASC')
+        })
+        .then((result) => {
+          // Make sure the accounts did not change
+          assert.equal(result.rowCount, 2)
+          assert.equal(result.rows[0].amount, 100)
+          assert.equal(result.rows[1].amount, 100)
+        })
+    })
+  })
 })
